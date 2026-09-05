@@ -6,3 +6,5 @@ joblib
 requests
 configparser
 plotly
+nbformat>=4.2.0
+pyspark
