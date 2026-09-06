@@ -21,6 +21,8 @@ Fraud is a rare-event classification problem: a model can be highly accurate whi
 
 The purpose is not merely to train a model. It is to demonstrate how an ML system can be made reproducible, reviewable, and safer to operate.
 
+> **A small philosophical note.** Fraud detection is an exercise in attention: most transactions are ordinary, but the system is judged by how carefully it notices the few that are not. The goal is not to automate suspicion. It is to build a decision-support system that makes its uncertainty, evidence, and limits visible to the people accountable for acting on it.
+
 ```mermaid
 flowchart LR
     A[(Credit-card<br/>transactions)] --> B[Data validation<br/>& split]
@@ -41,6 +43,47 @@ flowchart LR
     class B,C,D,E cyan;
     class G,I,J,K green;
 ```
+
+## The signal: what is in the data?
+
+The project uses the public **ULB Credit Card Fraud Detection** dataset: European card transactions from September 2013. It contains **284,807 transactions**, of which **492 are frauds**—roughly **0.17%** of the data. That extreme imbalance is the central engineering and modelling challenge.
+
+| Field group | Fields | Meaning | How this project uses it |
+|---|---|---|---|
+| Transaction time | `Time` | Seconds elapsed since the first transaction in the dataset | Numeric model feature |
+| Anonymized behaviour | `V1` … `V28` | PCA-transformed, anonymized transaction features | Numeric model features; their business meaning is intentionally unavailable |
+| Transaction value | `Amount` | Transaction amount | Numeric model feature |
+| Ground-truth label | `Class` | `0` = legitimate; `1` = fraud | Prediction target; never supplied to inference |
+
+```mermaid
+flowchart LR
+    A[Transaction row] --> B[Time]
+    A --> C[V1 … V28<br/>anonymized PCA features]
+    A --> D[Amount]
+    A --> E[Class<br/>0 legitimate · 1 fraud]
+    B --> F[Model input]
+    C --> F
+    D --> F
+    E --> G[Training / evaluation label]
+    classDef input fill:#062b3a,stroke:#00e5ff,color:#fff;
+    classDef label fill:#211443,stroke:#9c7cff,color:#fff;
+    class B,C,D,F input;
+    class E,G label;
+```
+
+Because the `V1`–`V28` features are anonymized and PCA transformed, this dataset is excellent for demonstrating the **ModelOps lifecycle** but limited for business interpretation, fairness analysis, and real-world feature lineage. A production fraud system would pair this workflow with governed source data, feature definitions, delayed fraud labels, privacy controls, and human review processes.
+
+## The agenda
+
+This repository follows a deliberate progression from a notebook-scale model to an operational ML lifecycle:
+
+1. **Understand the imbalance** — make fraud-focused evaluation the default.
+2. **Create reproducible experiments** — retain data-split decisions, parameter searches, metrics, and artifacts.
+3. **Establish a release decision** — distinguish a promising candidate from a model approved to serve.
+4. **Serve with a contract** — validate incoming feature schema and load a named model version.
+5. **Observe and improve** — collect safe operational signals, retrain candidates, and preserve a rollback path.
+
+The larger lesson is simple: a model is not a product at the moment it produces a score. It becomes a dependable system only when the path from data to decision can be inspected, challenged, and improved.
 
 ## Why fraud metrics—not just accuracy?
 
