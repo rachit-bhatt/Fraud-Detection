@@ -1,0 +1,36 @@
+{
+  "development_metrics": {
+    "accuracy": 0.984298473062518,
+    "fraud_precision": 0.68,
+    "fraud_recall": 0.1440677966101695,
+    "fraud_f1": 0.23776223776223776,
+    "roc_auc": 0.6468731992767301
+  },
+  "validation_metrics": {
+    "accuracy": 0.9956462202872091,
+    "fraud_precision": 0.10106382978723404,
+    "fraud_recall": 0.19387755102040816,
+    "fraud_f1": 0.13286713286713286,
+    "roc_auc": 0.6524175476324463
+  },
+  "confusion_matrix": [
+    [
+      6816,
+      8
+    ],
+    [
+      101,
+      17
+    ]
+  ],
+  "validation_confusion_matrix": [
+    [
+      56695,
+      169
+    ],
+    [
+      79,
+      19
+    ]
+  ]
+}
