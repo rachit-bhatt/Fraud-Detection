@@ -30,6 +30,7 @@ class MLflowExperimentManager:
         self.min_fraud_f1 = min_fraud_f1
         self.min_fraud_recall = min_fraud_recall
         self.run_ids: dict[str, str] = {}
+        self.model_uris: dict[str, str] = {}
 
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         mlflow.set_tracking_uri(self.tracking_uri)
@@ -45,8 +46,8 @@ class MLflowExperimentManager:
         return params
 
     @staticmethod
-    def _metrics(project: Any, model_name: str) -> dict[str, float]:
-        report = project.summarize_model_metrics().loc[model_name]
+    def _metrics(summary: pd.DataFrame, model_name: str) -> dict[str, float]:
+        report = summary.loc[model_name]
         return {
             "accuracy": float(report["accuracy"]),
             "fraud_precision": float(report["fraud_precision"]),
@@ -73,10 +74,16 @@ class MLflowExperimentManager:
 
     def log_project_models(self, project: Any) -> pd.DataFrame:
         """Create one MLflow run per trained model and log metrics/artifacts."""
+        if not project.validation_results:
+            project.validate_models()
+
+        development_summary = project.summarize_model_metrics()
+        validation_summary = project.validation_summary()
         records = []
 
         for model_name, model in project.models.items():
-            metrics = self._metrics(project, model_name)
+            development_metrics = self._metrics(development_summary, model_name)
+            validation_metrics = self._metrics(validation_summary, model_name)
             with mlflow.start_run(run_name=model_name) as run:
                 mlflow.set_tags({
                     "model_name": model_name,
@@ -84,18 +91,36 @@ class MLflowExperimentManager:
                     "data_path": project.dataset_path,
                 })
                 mlflow.log_params(self._safe_params(model))
-                mlflow.log_metrics(metrics)
+                mlflow.log_metrics({
+                    f"development_{key}": value
+                    for key, value in development_metrics.items()
+                    if key != "roc_auc" or pd.notna(value)
+                })
+                mlflow.log_metrics({
+                    f"validation_{key}": value
+                    for key, value in validation_metrics.items()
+                    if key != "roc_auc" or pd.notna(value)
+                })
                 mlflow.log_dict({
-                    "metrics": metrics,
+                    "development_metrics": development_metrics,
+                    "validation_metrics": validation_metrics,
                     "confusion_matrix": project.results[model_name]["confusion_matrix"].tolist(),
+                    "validation_confusion_matrix": project.validation_results[model_name]["confusion_matrix"].tolist(),
                 }, "evaluation.json")
                 mlflow.log_artifact(self._log_confusion_matrix(project, model_name))
-                mlflow.sklearn.log_model(model, name="model")
+                model_info = mlflow.sklearn.log_model(model, name="model")
                 self.run_ids[model_name] = run.info.run_id
+                self.model_uris[model_name] = model_info.model_uri
 
-            records.append({"model": model_name, "run_id": self.run_ids[model_name], **metrics})
+            records.append({
+                "model": model_name,
+                "run_id": self.run_ids[model_name],
+                **{f"validation_{key}": value for key, value in validation_metrics.items()},
+            })
 
-        return pd.DataFrame(records).set_index("model").sort_values("fraud_f1", ascending=False)
+        return pd.DataFrame(records).set_index("model").sort_values(
+            "validation_fraud_f1", ascending=False
+        )
 
     def _passes_promotion_gate(self, metrics: pd.Series) -> bool:
         return (
@@ -105,7 +130,9 @@ class MLflowExperimentManager:
 
     def register_best_model(self, project: Any, metric: str = "fraud_f1") -> dict[str, Any]:
         """Register the best logged model and assign the champion alias if it passes the gate."""
-        summary = project.summarize_model_metrics()
+        if not project.validation_results:
+            project.validate_models()
+        summary = project.validation_summary()
         model_name = project.select_best_model(summary, metric=metric)
         metrics = summary.loc[model_name]
         run_id = self.run_ids.get(model_name)
@@ -117,7 +144,7 @@ class MLflowExperimentManager:
                 f"fraud_recall={metrics['fraud_recall']:.4f}"
             )
 
-        model_uri = f"runs:/{run_id}/model"
+        model_uri = self.model_uris.get(model_name, f"runs:/{run_id}/model")
         model_version = mlflow.register_model(model_uri, self.registered_model_name)
         self.client.set_model_version_tag(
             self.registered_model_name,
