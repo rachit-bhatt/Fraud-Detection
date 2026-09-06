@@ -1,258 +1,232 @@
-# Required Imports
-import pandas as pd
+"""Reproducible fraud-model training, validation, and MLflow tracking.
+
+Run ``python main.py --quick`` for a local smoke-sized model search, or omit
+``--quick`` for the complete configured search. The final validation split is
+never used for sampling, hyperparameter search, or threshold selection.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import joblib
 import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+import pandas as pd
+from sklearn.base import ClassifierMixin
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
+from sklearn.metrics import average_precision_score, classification_report, confusion_matrix, roc_auc_score
+from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    accuracy_score,
-    average_precision_score,
-    roc_auc_score,
-)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+
 from mlops import MLflowExperimentManager
-import matplotlib.pyplot as plt
-import seaborn as sns
-import plotly.graph_objects as go
-import warnings
-warnings.filterwarnings('ignore')
 
-# Import PySpark only if Spark is used
-try:
-    from pyspark.sql import SparkSession
-    from pyspark.sql.functions import col
-except ImportError:
-    SparkSession = None
 
-# Fraud Detection Project Class
+@dataclass(frozen=True)
+class TrainingConfig:
+    dataset_path: Path = Path("data/creditcard.csv")
+    model_path: Path = Path("models/fraud_detection_model.pkl")
+    random_state: int = 42
+    validation_size: float = 0.20
+    test_size: float = 0.30
+    non_fraud_sample_fraction: float = 0.10
+    cv_folds: int = 5
+    search_scoring: str = "f1"
+    threshold_candidates: tuple[float, ...] = tuple(np.round(np.arange(0.10, 0.91, 0.05), 2))
+
+
 class FraudDetectionProject:
-    def __init__(self, use_local=False, mlflow_manager=None):
-        self.dataset_url = 'https://www.kaggle.com/mlg-ulb/creditcardfraud/download'
-        self.dataset_path = 'data/creditcard.csv'
-        self.model_path = 'models/fraud_detection_model.pkl'
-        self.use_local = use_local
-        self.spark = None
-        self.df_spark = None
-        self.df_pandas = None
-        self.X_train = None
-        self.X_test = None
-        self.y_train = None
-        self.y_test = None
-        self.models = {}
-        self.results = {}
-        self.mlflow_manager = mlflow_manager or MLflowExperimentManager()
+    """Owns data preparation, candidate training, evaluation, and selection."""
 
-        if not self.use_local and SparkSession is not None:
-            self.spark = SparkSession.builder.appName("FraudDetection").getOrCreate()
-    
-    def load_data(self):
-        if not self.use_local and self.spark is not None:
-            # Read dataset into a Spark DataFrame
-            self.df_spark = self.spark.read.csv(self.dataset_path, header=True, inferSchema=True)
-        else:
-            # Load the dataset locally with Pandas
-            self.df_pandas = pd.read_csv(self.dataset_path)
-    
-    def preprocess_data(self):
-        if not self.use_local and self.spark is not None:
-            # Spark Preprocessing
-            self.df_spark = self.df_spark.withColumn("Class", col("Class").cast("integer"))
-            
-            # Balance the dataset
-            fraud_cases = self.df_spark.filter(self.df_spark['Class'] == 1)
-            non_fraud_cases = self.df_spark.filter(self.df_spark['Class'] == 0).sample(fraction=0.1)
-            balanced_data = fraud_cases.union(non_fraud_cases)
-            
-            # Convert Spark DataFrame to Pandas DataFrame
-            self.df_pandas = balanced_data.toPandas()
-        else:
-            # Local Pandas Preprocessing
-            # Balance the dataset locally
-            fraud_cases = self.df_pandas[self.df_pandas['Class'] == 1]
-            non_fraud_cases = self.df_pandas[self.df_pandas['Class'] == 0].sample(frac=0.1, random_state=42)
-            self.df_pandas = pd.concat([fraud_cases, non_fraud_cases])
+    def __init__(self, config: TrainingConfig | None = None) -> None:
+        self.config = config or TrainingConfig()
+        self.df_original: pd.DataFrame | None = None
+        self.X_train: pd.DataFrame | None = None
+        self.X_test: pd.DataFrame | None = None
+        self.X_validation: pd.DataFrame | None = None
+        self.y_train: pd.Series | None = None
+        self.y_test: pd.Series | None = None
+        self.y_validation: pd.Series | None = None
+        self.models: dict[str, ClassifierMixin] = {}
+        self.training_metadata: dict[str, dict[str, Any]] = {}
+        self.results: dict[str, dict[str, Any]] = {}
+        self.validation_results: dict[str, dict[str, Any]] = {}
+        self.thresholds: dict[str, float] = {}
+        self.best_model: str | None = None
 
-        # Split data into X (features) and y (target)
-        X = self.df_pandas.drop(columns=['Class'])
-        y = self.df_pandas['Class']
-        
-        # Split the data into training and testing sets
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
-            X,
-            y,
-            test_size=0.3,
-            random_state=42,
-            stratify=y,
+    @property
+    def feature_names(self) -> list[str]:
+        return list(self.X_train.columns) if self.X_train is not None else []
+
+    def load_data(self) -> None:
+        if not self.config.dataset_path.exists():
+            raise FileNotFoundError(f"Dataset not found: {self.config.dataset_path}")
+        self.df_original = pd.read_csv(self.config.dataset_path)
+        if "Class" not in self.df_original or set(self.df_original.Class.dropna().unique()) - {0, 1}:
+            raise ValueError("Dataset requires a binary 'Class' target column.")
+
+    def preprocess_data(self) -> None:
+        """Create an untouched holdout, then balance development data only."""
+        if self.df_original is None:
+            raise ValueError("Run load_data() before preprocess_data().")
+        X, y = self.df_original.drop(columns="Class"), self.df_original.Class
+        development_X, self.X_validation, development_y, self.y_validation = train_test_split(
+            X, y, test_size=self.config.validation_size, random_state=self.config.random_state, stratify=y
         )
-    
-    def train_model(self, model_name, model, param_grid=None):
-        # Train a model with optional hyper-parameter tuning
+        development = development_X.assign(Class=development_y)
+        fraud = development[development.Class == 1]
+        non_fraud = development[development.Class == 0].sample(
+            frac=self.config.non_fraud_sample_fraction, random_state=self.config.random_state
+        )
+        balanced = pd.concat([fraud, non_fraud], ignore_index=True).sample(frac=1, random_state=self.config.random_state)
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+            balanced.drop(columns="Class"), balanced.Class, test_size=self.config.test_size,
+            random_state=self.config.random_state, stratify=balanced.Class,
+        )
+
+    def train_model(self, model_name: str, model: ClassifierMixin, param_grid: dict[str, list[Any]] | None = None) -> None:
+        if self.X_train is None or self.y_train is None:
+            raise ValueError("Run preprocess_data() before training.")
+        metadata: dict[str, Any] = {"search_performed": bool(param_grid), "model_class": type(model).__name__}
         if param_grid:
-            grid_search = GridSearchCV(model, param_grid, cv=5, n_jobs=-1, verbose=1)
-            grid_search.fit(self.X_train, self.y_train)
-            best_model = grid_search.best_estimator_
-            self.models[model_name] = best_model
+            search = GridSearchCV(model, param_grid, cv=self.config.cv_folds, n_jobs=-1,
+                                  scoring=self.config.search_scoring, refit=True, verbose=1).fit(self.X_train, self.y_train)
+            self.models[model_name] = search.best_estimator_
+            metadata.update({"cv_folds": self.config.cv_folds, "search_scoring": self.config.search_scoring,
+                             "best_params": search.best_params_, "best_cv_score": float(search.best_score_),
+                             "candidate_count": len(search.cv_results_["params"])})
         else:
-            model.fit(self.X_train, self.y_train)
-            self.models[model_name] = model
+            self.models[model_name] = model.fit(self.X_train, self.y_train)
+        self.training_metadata[model_name] = metadata
 
     @staticmethod
-    def _prediction_scores(model, X):
-        if hasattr(model, 'predict_proba'):
+    def _prediction_scores(model: ClassifierMixin, X: pd.DataFrame) -> np.ndarray | None:
+        if hasattr(model, "predict_proba"):
             return model.predict_proba(X)[:, 1]
-        if hasattr(model, 'decision_function'):
+        if hasattr(model, "decision_function"):
             return model.decision_function(X)
         return None
-    
-    def evaluate_model(self, model_name):
-        # Evaluate using fraud-focused metrics and create the MLflow run.
+
+    @staticmethod
+    def _metrics(y_true: pd.Series, y_pred: np.ndarray, y_score: np.ndarray | None) -> dict[str, Any]:
+        report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+        return {"accuracy": float(report["accuracy"]), "fraud_precision": float(report["1"]["precision"]),
+                "fraud_recall": float(report["1"]["recall"]), "fraud_f1": float(report["1"]["f1-score"]),
+                "roc_auc": float(roc_auc_score(y_true, y_score)) if y_score is not None else float("nan"),
+                "pr_auc": float(average_precision_score(y_true, y_score)) if y_score is not None else float("nan"),
+                "confusion_matrix": confusion_matrix(y_true, y_pred), "classification_report": report}
+
+    def evaluate_model(self, model_name: str, threshold: float = 0.5) -> dict[str, Any]:
+        if self.X_test is None or self.y_test is None:
+            raise ValueError("Run preprocess_data() before evaluation.")
         model = self.models[model_name]
-        y_pred = model.predict(self.X_test)
-        y_score = self._prediction_scores(model, self.X_test)
-        report = classification_report(
-            self.y_test,
-            y_pred,
-            output_dict=True,
-            zero_division=0,
-        )
-        
-        self.results[model_name] = {
-            'confusion_matrix': confusion_matrix(self.y_test, y_pred),
-            'classification_report': classification_report(self.y_test, y_pred, zero_division=0),
-            'accuracy': report['accuracy'],
-            'accuracy_score': accuracy_score(self.y_test, y_pred),
-            'fraud_precision': report['1']['precision'],
-            'fraud_recall': report['1']['recall'],
-            'fraud_f1': report['1']['f1-score'],
-            'roc_auc': roc_auc_score(self.y_test, y_score) if y_score is not None else np.nan,
-            'pr_auc': average_precision_score(self.y_test, y_score) if y_score is not None else np.nan,
-            'y_pred': y_pred,
-        }
-        self.mlflow_manager.log_model_run(self, model_name)
-    
-    def print_results(self, model_name):
-        result = self.results[model_name]
-        print(f"Results for {model_name}:\n")
-        print(f"Confusion Matrix:\n{result['confusion_matrix']}\n")
-        print(f"Classification Report:\n{result['classification_report']}\n")
-        print(f"Fraud Precision: {result['fraud_precision']:.4f}")
-        print(f"Fraud Recall: {result['fraud_recall']:.4f}")
-        print(f"Fraud F1: {result['fraud_f1']:.4f}")
-        print(f"PR-AUC: {result['pr_auc']:.4f}")
-        print(f"ROC-AUC: {result['roc_auc']:.4f}\n")
-    
-    def visualize_confusion_matrix(self, model_name):
-        # Visualize the confusion matrix for the specified model
-        matrix = self.results[model_name]['confusion_matrix']
-        plt.figure(figsize=(25.6, 16))
-        sns.heatmap(matrix, annot=True, fmt="d", cmap="Blues", cbar=False)
-        plt.title(f"Confusion Matrix for {model_name}")
-        plt.xlabel("Predicted")
-        plt.ylabel("Actual")
-        plt.show()
+        scores = self._prediction_scores(model, self.X_test)
+        predictions = (scores >= threshold).astype(int) if scores is not None else model.predict(self.X_test)
+        result = self._metrics(self.y_test, predictions, scores)
+        result["threshold"] = threshold
+        self.results[model_name] = result
+        return result
 
-    def visualize_correlation_heatmap(self):
-        # Visualize a heatmap of correlations between features
-        correlation_matrix = self.df_pandas.corr()
-        plt.figure(figsize=(25.6, 16))
-        sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', fmt='.2f')
-        plt.title("Correlation Heatmap")
-        plt.show()
-    
-    def run_experiments(self):
-        # Random Forest with Hyper-Parameter Tuning
-        param_grid_rf = {
-            'n_estimators': [100, 200],
-            'max_depth': [10, 20],
-            'min_samples_split': [2, 5]
-        }
-        self.train_model("RandomForest", RandomForestClassifier(), param_grid_rf)
-        self.evaluate_model("RandomForest")
-        
-        # Gradient Boosting (XGBoost) with Hyper-Parameter Tuning
-        param_grid_gb = {
-            'n_estimators': [100, 200],
-            'learning_rate': [0.01, 0.1],
-            'max_depth': [3, 5]
-        }
-        self.train_model("GradientBoosting", GradientBoostingClassifier(), param_grid_gb)
-        self.evaluate_model("GradientBoosting")
-        
-        # Logistic Regression (Standard)
-        self.train_model("LogisticRegression", LogisticRegression(max_iter=1000))
-        self.evaluate_model("LogisticRegression")
-        
-        # Support Vector Machine with Hyper-Parameter Tuning
-        param_grid_svm = {
-            'C': [0.1, 1, 10],
-            'kernel': ['linear', 'rbf']
-        }
-        self.train_model("SVM", SVC(), param_grid_svm)
-        self.evaluate_model("SVM")
-        
-        # K-Nearest Neighbors with Hyper-Parameter Tuning
-        param_grid_knn = {
-            'n_neighbors': [3, 5, 7],
-            'weights': ['uniform', 'distance']
-        }
-        self.train_model("KNN", KNeighborsClassifier(), param_grid_knn)
-        self.evaluate_model("KNN")
-    
-    def visualize_all_results(self):
-        for model_name in self.models.keys():
-            self.print_results(model_name)
-            self.visualize_confusion_matrix(model_name)
-    
-    def compare_models(self):
-        # Compare fraud metrics; accuracy is retained only as a reference.
-        model_names = list(self.results.keys())
-        metrics = pd.DataFrame({
-            'Fraud F1': [self.results[model]['fraud_f1'] for model in model_names],
-            'Fraud Recall': [self.results[model]['fraud_recall'] for model in model_names],
-            'PR-AUC': [self.results[model]['pr_auc'] for model in model_names],
-            'Accuracy': [self.results[model]['accuracy'] for model in model_names],
-        }, index=model_names)
-        print(metrics.sort_values('Fraud F1', ascending=False).round(4))
+    def tune_threshold(self, model_name: str, metric: str = "fraud_f1") -> float:
+        """Choose a score threshold on development data; never final holdout."""
+        if self.X_test is None or self.y_test is None:
+            raise ValueError("Run preprocess_data() before threshold tuning.")
+        scores = self._prediction_scores(self.models[model_name], self.X_test)
+        if scores is None:
+            self.thresholds[model_name] = 0.5
+            return 0.5
+        best_threshold, best_value = 0.5, -1.0
+        for threshold in self.config.threshold_candidates:
+            value = self._metrics(self.y_test, (scores >= threshold).astype(int), scores)[metric]
+            if value > best_value:
+                best_threshold, best_value = threshold, value
+        self.thresholds[model_name] = float(best_threshold)
+        return float(best_threshold)
 
-        fig = go.Figure(data=[
-            go.Bar(name='Fraud F1', x=model_names, y=metrics['Fraud F1']),
-            go.Bar(name='Fraud Recall', x=model_names, y=metrics['Fraud Recall']),
-            go.Bar(name='PR-AUC', x=model_names, y=metrics['PR-AUC']),
-        ])
-        fig.update_layout(
-            title='Fraud Model Comparison',
-            xaxis_title='Model',
-            yaxis_title='Score',
-            template='plotly_white'
-        )
-        fig.show()
+    def validate_models(self) -> pd.DataFrame:
+        """Evaluate each candidate once on original-distribution final holdout."""
+        if self.X_validation is None or self.y_validation is None:
+            raise ValueError("Run preprocess_data() before final validation.")
+        for name, model in self.models.items():
+            scores = self._prediction_scores(model, self.X_validation)
+            threshold = self.thresholds.get(name, 0.5)
+            predictions = (scores >= threshold).astype(int) if scores is not None else model.predict(self.X_validation)
+            result = self._metrics(self.y_validation, predictions, scores)
+            result["threshold"] = threshold
+            self.validation_results[name] = result
+        return self.summary(final=True)
 
-    def compare_accuracies(self):
-        """Backward-compatible alias for the fraud-metrics comparison."""
-        self.compare_models()
+    def summary(self, final: bool = False) -> pd.DataFrame:
+        source = self.validation_results if final else self.results
+        rows = [{"model": name, **{k: v for k, v in result.items() if isinstance(v, (int, float, np.floating))}}
+                for name, result in source.items()]
+        return pd.DataFrame(rows).set_index("model").sort_values("fraud_f1", ascending=False)
 
-# Main Function to run the project
+    def select_best_model(self, metric: str = "fraud_f1") -> str:
+        summary = self.summary(final=True)
+        if summary.empty or metric not in summary:
+            raise ValueError("Run validate_models() before selecting a model.")
+        self.best_model = str(summary[metric].idxmax())
+        return self.best_model
+
+    def save_model(self, model_name: str | None = None) -> Path:
+        name = model_name or self.best_model
+        if name is None or name not in self.models:
+            raise ValueError("Select or supply a trained model before saving.")
+        self.config.model_path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self.models[name], self.config.model_path)
+        return self.config.model_path
+
+    def run_experiments(self, quick: bool = False) -> None:
+        """Train existing five model families with reproducible bounded searches."""
+        rf_grid = {"n_estimators": [100] if quick else [100, 200], "max_depth": [10, 20], "min_samples_split": [2, 5]}
+        gb_grid = {"n_estimators": [100] if quick else [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]}
+        svm_grid = {"model__C": [1] if quick else [0.1, 1, 10], "model__kernel": ["linear", "rbf"]}
+        knn_grid = {"model__n_neighbors": [5] if quick else [3, 5, 7], "model__weights": ["uniform", "distance"]}
+        candidates: list[tuple[str, ClassifierMixin, dict[str, list[Any]] | None]] = [
+            ("RandomForest", RandomForestClassifier(random_state=self.config.random_state, n_jobs=-1), rf_grid),
+            ("GradientBoosting", GradientBoostingClassifier(random_state=self.config.random_state), gb_grid),
+            ("LogisticRegression", Pipeline([("scale", StandardScaler()), ("model", LogisticRegression(max_iter=1000, random_state=self.config.random_state))]), None),
+            ("SVM", Pipeline([("scale", StandardScaler()), ("model", SVC(probability=True, random_state=self.config.random_state))]), svm_grid),
+            ("KNN", Pipeline([("scale", StandardScaler()), ("model", KNeighborsClassifier())]), knn_grid),
+        ]
+        for name, model, grid in candidates:
+            self.train_model(name, model, grid)
+            self.evaluate_model(name)
+            self.tune_threshold(name)
+            self.evaluate_model(name, self.thresholds[name])
+
+    def metadata(self) -> dict[str, Any]:
+        if self.df_original is None:
+            return {}
+        return {"dataset_path": str(self.config.dataset_path), "dataset_rows": len(self.df_original),
+                "fraud_rate": float(self.df_original.Class.mean()), "feature_count": len(self.feature_names),
+                "random_state": self.config.random_state, "validation_size": self.config.validation_size,
+                "development_non_fraud_fraction": self.config.non_fraud_sample_fraction}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--quick", action="store_true", help="Use reduced parameter grids for a smoke-sized run.")
+    parser.add_argument("--promote", action="store_true", help="Attempt gated registry promotion after validation.")
+    args = parser.parse_args()
+    project = FraudDetectionProject()
+    project.load_data(); project.preprocess_data(); project.run_experiments(quick=args.quick)
+    print("Development metrics:\n", project.summary().round(4))
+    print("Final holdout metrics:\n", project.validate_models().round(4))
+    tracker = MLflowExperimentManager()
+    print("MLflow runs:\n", tracker.log_project_models(project).round(4))
+    winner = project.select_best_model()
+    print(f"Best final-holdout candidate: {winner}")
+    if args.promote:
+        print(json.dumps(tracker.register_best_model(project), indent=2, default=str))
+
+
 if __name__ == "__main__":
-    # Create an instance of the project with the `use_local` flag
-    # Set use_local=True to run locally, use_local=False to run with Spark
-    fraud_project = FraudDetectionProject(use_local=True)
-
-    # Load data and initialize
-    fraud_project.load_data()
-
-    # Preprocess the data and split into training and testing sets
-    fraud_project.preprocess_data()
-
-    # Run experiments with various algorithms
-    fraud_project.run_experiments()
-
-    # Visualize correlation heatmap and confusion matrices for all models
-    fraud_project.visualize_correlation_heatmap()
-    fraud_project.visualize_all_results()
-
-    # Compare fraud-focused metrics and display the MLflow experiment runs
-    fraud_project.compare_models()
-    display(fraud_project.mlflow_manager.tracked_run_summary().round(4))
+    main()

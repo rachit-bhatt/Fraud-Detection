@@ -1,0 +1,17 @@
+name: Scheduled candidate retraining
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 1 * *'
+jobs:
+  train-candidate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install -r requirements.txt
+      # Configure MLFLOW_TRACKING_URI as a repository secret/environment for persistent remote tracking.
+      - run: python retrain.py
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}

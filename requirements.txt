@@ -11,4 +11,4 @@ pyspark
 mlflow
 fastapi
 uvicorn
-SparkSession
+pytest

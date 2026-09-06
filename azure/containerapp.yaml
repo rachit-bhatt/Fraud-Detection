@@ -1,0 +1,12 @@
+# Replace placeholders only through your deployment environment or CI secrets.
+properties:
+  configuration:
+    ingress: {external: true, targetPort: 8000}
+  template:
+    containers:
+      - name: fraud-api
+        image: YOUR_ACR.azurecr.io/fraud-detection:latest
+        resources: {cpu: 0.5, memory: 1Gi}
+        env:
+          - {name: MLFLOW_TRACKING_URI, value: YOUR_MANAGED_MLFLOW_URI}
+          - {name: MLFLOW_MODEL_URI, value: models:/fraud-detection-model@champion}
