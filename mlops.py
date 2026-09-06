@@ -56,6 +56,44 @@ class MLflowExperimentManager:
             "roc_auc": float(report["roc_auc"]),
         }
 
+    def log_model_run(self, project: Any, model_name: str) -> str:
+        """Log one completed train/evaluate cycle as a single MLflow run."""
+        model = project.models[model_name]
+        result = project.results[model_name]
+        metrics = {
+            "accuracy": float(result["accuracy"]),
+            "fraud_precision": float(result["fraud_precision"]),
+            "fraud_recall": float(result["fraud_recall"]),
+            "fraud_f1": float(result["fraud_f1"]),
+            "pr_auc": float(result["pr_auc"]),
+            "roc_auc": float(result["roc_auc"]),
+        }
+        with mlflow.start_run(run_name=model_name) as run:
+            mlflow.set_tags({
+                "model_name": model_name,
+                "task": "fraud_detection",
+                "tracking_stage": "train_evaluate",
+            })
+            mlflow.log_params(self._safe_params(model))
+            mlflow.log_metrics(metrics)
+            mlflow.log_dict({
+                "metrics": metrics,
+                "confusion_matrix": result["confusion_matrix"].tolist(),
+            }, "evaluation.json")
+            mlflow.log_artifact(self._log_confusion_matrix(project, model_name))
+            model_info = mlflow.sklearn.log_model(model, name="model")
+            self.run_ids[model_name] = run.info.run_id
+            self.model_uris[model_name] = model_info.model_uri
+        return self.run_ids[model_name]
+
+    def tracked_run_summary(self) -> pd.DataFrame:
+        """Return the runs created by train_model/evaluate_model."""
+        rows = []
+        for model_name, run_id in self.run_ids.items():
+            run = self.client.get_run(run_id)
+            rows.append({"model": model_name, "run_id": run_id, **run.data.metrics})
+        return pd.DataFrame(rows).set_index("model").sort_values("fraud_f1", ascending=False)
+
     def _log_confusion_matrix(self, project: Any, model_name: str) -> str:
         output_path = self.artifact_root / f"{model_name}_confusion_matrix.png"
         matrix = project.results[model_name]["confusion_matrix"]
