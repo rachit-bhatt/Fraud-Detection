@@ -6,7 +6,14 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+    average_precision_score,
+    roc_auc_score,
+)
+from mlops import MLflowExperimentManager
 import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.graph_objects as go
@@ -22,7 +29,7 @@ except ImportError:
 
 # Fraud Detection Project Class
 class FraudDetectionProject:
-    def __init__(self, use_local=False):
+    def __init__(self, use_local=False, mlflow_manager=None):
         self.dataset_url = 'https://www.kaggle.com/mlg-ulb/creditcardfraud/download'
         self.dataset_path = 'data/creditcard.csv'
         self.model_path = 'models/fraud_detection_model.pkl'
@@ -36,6 +43,7 @@ class FraudDetectionProject:
         self.y_test = None
         self.models = {}
         self.results = {}
+        self.mlflow_manager = mlflow_manager or MLflowExperimentManager()
 
         if not self.use_local and SparkSession is not None:
             self.spark = SparkSession.builder.appName("FraudDetection").getOrCreate()
@@ -72,7 +80,13 @@ class FraudDetectionProject:
         y = self.df_pandas['Class']
         
         # Split the data into training and testing sets
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+            X,
+            y,
+            test_size=0.3,
+            random_state=42,
+            stratify=y,
+        )
     
     def train_model(self, model_name, model, param_grid=None):
         # Train a model with optional hyper-parameter tuning
@@ -84,26 +98,51 @@ class FraudDetectionProject:
         else:
             model.fit(self.X_train, self.y_train)
             self.models[model_name] = model
+
+    @staticmethod
+    def _prediction_scores(model, X):
+        if hasattr(model, 'predict_proba'):
+            return model.predict_proba(X)[:, 1]
+        if hasattr(model, 'decision_function'):
+            return model.decision_function(X)
+        return None
     
     def evaluate_model(self, model_name):
-        # Evaluate the trained model and store the results
+        # Evaluate using fraud-focused metrics and create the MLflow run.
         model = self.models[model_name]
         y_pred = model.predict(self.X_test)
+        y_score = self._prediction_scores(model, self.X_test)
+        report = classification_report(
+            self.y_test,
+            y_pred,
+            output_dict=True,
+            zero_division=0,
+        )
         
-        # Store evaluation metrics
         self.results[model_name] = {
             'confusion_matrix': confusion_matrix(self.y_test, y_pred),
-            'classification_report': classification_report(self.y_test, y_pred),
+            'classification_report': classification_report(self.y_test, y_pred, zero_division=0),
+            'accuracy': report['accuracy'],
             'accuracy_score': accuracy_score(self.y_test, y_pred),
-            'y_pred': y_pred
+            'fraud_precision': report['1']['precision'],
+            'fraud_recall': report['1']['recall'],
+            'fraud_f1': report['1']['f1-score'],
+            'roc_auc': roc_auc_score(self.y_test, y_score) if y_score is not None else np.nan,
+            'pr_auc': average_precision_score(self.y_test, y_score) if y_score is not None else np.nan,
+            'y_pred': y_pred,
         }
+        self.mlflow_manager.log_model_run(self, model_name)
     
     def print_results(self, model_name):
-        # Print the evaluation metrics for a specific model
+        result = self.results[model_name]
         print(f"Results for {model_name}:\n")
-        print(f"Confusion Matrix:\n{self.results[model_name]['confusion_matrix']}\n")
-        print(f"Classification Report:\n{self.results[model_name]['classification_report']}\n")
-        print(f"Accuracy: {self.results[model_name]['accuracy_score']:.4f}\n")
+        print(f"Confusion Matrix:\n{result['confusion_matrix']}\n")
+        print(f"Classification Report:\n{result['classification_report']}\n")
+        print(f"Fraud Precision: {result['fraud_precision']:.4f}")
+        print(f"Fraud Recall: {result['fraud_recall']:.4f}")
+        print(f"Fraud F1: {result['fraud_f1']:.4f}")
+        print(f"PR-AUC: {result['pr_auc']:.4f}")
+        print(f"ROC-AUC: {result['roc_auc']:.4f}\n")
     
     def visualize_confusion_matrix(self, model_name):
         # Visualize the confusion matrix for the specified model
@@ -167,28 +206,33 @@ class FraudDetectionProject:
             self.print_results(model_name)
             self.visualize_confusion_matrix(model_name)
     
-    def compare_accuracies(self):
-        # Create an interactive bar chart comparing accuracies of different models
+    def compare_models(self):
+        # Compare fraud metrics; accuracy is retained only as a reference.
         model_names = list(self.results.keys())
-        accuracies = [self.results[model]['accuracy_score'] for model in model_names]
-        
-        # Define min and max range for accuracy based on the data
-        min_accuracy = min(accuracies) - 0.01
-        max_accuracy = max(accuracies) + 0.01
-        
+        metrics = pd.DataFrame({
+            'Fraud F1': [self.results[model]['fraud_f1'] for model in model_names],
+            'Fraud Recall': [self.results[model]['fraud_recall'] for model in model_names],
+            'PR-AUC': [self.results[model]['pr_auc'] for model in model_names],
+            'Accuracy': [self.results[model]['accuracy'] for model in model_names],
+        }, index=model_names)
+        print(metrics.sort_values('Fraud F1', ascending=False).round(4))
+
         fig = go.Figure(data=[
-            go.Bar(name='Accuracy', x=model_names, y=accuracies, marker_color='blue')
+            go.Bar(name='Fraud F1', x=model_names, y=metrics['Fraud F1']),
+            go.Bar(name='Fraud Recall', x=model_names, y=metrics['Fraud Recall']),
+            go.Bar(name='PR-AUC', x=model_names, y=metrics['PR-AUC']),
         ])
-        
         fig.update_layout(
-            title='Model Comparison - Accuracy Scores',
+            title='Fraud Model Comparison',
             xaxis_title='Model',
-            yaxis_title='Accuracy',
-            yaxis=dict(range=[max(0, min_accuracy), min(1, max_accuracy)]),
+            yaxis_title='Score',
             template='plotly_white'
         )
-        
         fig.show()
+
+    def compare_accuracies(self):
+        """Backward-compatible alias for the fraud-metrics comparison."""
+        self.compare_models()
 
 # Main Function to run the project
 if __name__ == "__main__":
@@ -209,5 +253,6 @@ if __name__ == "__main__":
     fraud_project.visualize_correlation_heatmap()
     fraud_project.visualize_all_results()
 
-    # Compare accuracies of different models
-    fraud_project.compare_accuracies()
+    # Compare fraud-focused metrics and display the MLflow experiment runs
+    fraud_project.compare_models()
+    display(fraud_project.mlflow_manager.tracked_run_summary().round(4))
