@@ -8,3 +8,6 @@ configparser
 plotly
 nbformat>=4.2.0
 pyspark
+mlflow
+fastapi
+uvicorn
