@@ -3,5 +3,6 @@ __pycache__/
 *.py[cod]
 mlruns/
 mlflow.db
+runtime/
 monitoring/*.jsonl
 .env

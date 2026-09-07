@@ -194,7 +194,7 @@ Remove `--quick` for the complete bounded hyperparameter search.
 ### Inspect experiments
 
 ```powershell
-mlflow ui --backend-store-uri sqlite:///mlflow.db --host 127.0.0.1 --port 5000
+mlflow ui --backend-store-uri sqlite:///runtime/mlflow.db --host 127.0.0.1 --port 5000
 ```
 
 Open [http://127.0.0.1:5000](http://127.0.0.1:5000), select **Fraud Detection**, sort candidates by `final_fraud_f1` and `final_fraud_recall`, then inspect the Parameters and Artifacts tabs.
@@ -213,7 +213,7 @@ If the gate fails, the command stops and the current champion remains unchanged.
 
 ## Serving the approved model
 
-The FastAPI service loads the registry champion by default:
+The FastAPI service loads the registry champion and its separately logged inference contract by default:
 
 ```text
 models:/fraud-detection-model@champion
@@ -226,7 +226,7 @@ uvicorn api:app --reload
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Confirms the configured MLflow model can load |
-| `POST /predict` | Validates input feature schema and returns a fraud prediction/score |
+| `POST /predict` | Validates the approved feature contract and returns a fraud prediction/score |
 | `GET /metrics` | Returns lightweight prediction-volume telemetry |
 
 Example request shape:
@@ -237,19 +237,18 @@ Example request shape:
     "Time": 0.0,
     "V1": -1.3598,
     "V2": -0.0728
-  },
-  "threshold": 0.5
+  }
 }
 ```
 
-> Send every feature expected by the trained model. The service rejects missing or unexpected fields rather than silently changing feature order.
+> Send every feature expected by the trained model. The service rejects missing or unexpected fields rather than silently changing feature order. The decision threshold is loaded from the approved champion contract; API callers cannot override it.
 
 ## Containerization
 
 ```powershell
 docker build -t fraud-detection-api .
 docker run --rm -p 8000:8000 `
-  -e MLFLOW_TRACKING_URI="sqlite:///mlflow.db" `
+  -e MLFLOW_TRACKING_URI="sqlite:///runtime/mlflow.db" `
   -e MLFLOW_MODEL_URI="models:/fraud-detection-model@champion" `
   fraud-detection-api
 ```
@@ -264,7 +263,7 @@ flowchart LR
     class B container;
 ```
 
-For a real deployment, use a remotely accessible MLflow backend/artifact store and inject configuration through environment variables or a secrets manager—never source code.
+For local development, runtime state is isolated in the ignored `runtime/` directory. For a real deployment, set `MLFLOW_TRACKING_URI` to a shared MLflow Tracking Server; its database and artifact store must be remotely accessible to both training and the API. Inject configuration through environment variables or a secrets manager—never source code.
 
 ---
 

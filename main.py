@@ -210,6 +210,21 @@ class FraudDetectionProject:
                 "random_state": self.config.random_state, "validation_size": self.config.validation_size,
                 "development_non_fraud_fraction": self.config.non_fraud_sample_fraction}
 
+    def model_contract(self, model_name: str) -> dict[str, Any]:
+        """Return the immutable inference contract evaluated for this candidate."""
+        if self.X_train is None or model_name not in self.thresholds:
+            raise ValueError("Train and tune a model before creating its inference contract.")
+        return {
+            "schema_version": 1,
+            "model_name": model_name,
+            "feature_names": self.feature_names,
+            "feature_dtypes": {name: str(dtype) for name, dtype in self.X_train.dtypes.items()},
+            "missing_value_policy": "reject",
+            "positive_class": 1,
+            "decision_threshold": self.thresholds[model_name],
+            "threshold_selection_metric": "fraud_f1",
+        }
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()

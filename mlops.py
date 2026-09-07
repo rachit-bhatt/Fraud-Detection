@@ -23,19 +23,23 @@ class MLflowExperimentManager:
     """
 
     def __init__(self, tracking_uri: str | None = None, experiment_name: str = "Fraud Detection",
-                 registered_model_name: str = "fraud-detection-model", artifact_root: str = "mlruns",
+                 registered_model_name: str = "fraud-detection-model", artifact_root: str = "runtime/mlruns",
                  min_fraud_f1: float = 0.85, min_fraud_recall: float = 0.80) -> None:
-        self.tracking_uri = tracking_uri or os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
+        self.tracking_uri = tracking_uri or os.getenv("MLFLOW_TRACKING_URI", "sqlite:///runtime/mlflow.db")
         self.experiment_name, self.registered_model_name = experiment_name, registered_model_name
         self.artifact_root = Path(artifact_root).resolve()
         self.min_fraud_f1, self.min_fraud_recall = min_fraud_f1, min_fraud_recall
         self.run_ids: dict[str, str] = {}
         self.model_uris: dict[str, str] = {}
+        self.is_local_tracking = self.tracking_uri.startswith(("sqlite:///", "file:"))
+        # The local directory is durable state only for local tracking; with a
+        # remote server it is used only as a transient artifact-rendering area.
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         mlflow.set_tracking_uri(self.tracking_uri)
         experiment = mlflow.get_experiment_by_name(experiment_name)
         if experiment is None:
-            experiment = mlflow.get_experiment(mlflow.create_experiment(experiment_name, artifact_location=self.artifact_root.as_uri()))
+            create_kwargs = {"artifact_location": self.artifact_root.as_uri()} if self.is_local_tracking else {}
+            experiment = mlflow.get_experiment(mlflow.create_experiment(experiment_name, **create_kwargs))
         self.experiment_id = experiment.experiment_id
         mlflow.set_experiment(experiment_name)
         self.client = MlflowClient(tracking_uri=self.tracking_uri)
@@ -89,6 +93,10 @@ class MLflowExperimentManager:
                     "search_performed": str(project.training_metadata[model_name]["search_performed"])}
             with mlflow.start_run(experiment_id=self.experiment_id, run_name=model_name) as run:
                 mlflow.set_tags(tags); mlflow.log_params(self._parameters(project, model_name)); mlflow.log_metrics(metrics)
+                contract = project.model_contract(model_name)
+                mlflow.set_tags({"model_contract_schema_version": str(contract["schema_version"]),
+                                 "decision_threshold": str(contract["decision_threshold"])})
+                mlflow.log_dict(contract, "model_contract.json")
                 mlflow.log_dict({"project_metadata": project.metadata(), "training_metadata": project.training_metadata[model_name],
                                  "development": self._serializable_result(development), "final_holdout": self._serializable_result(final)},
                                 "evaluation/evaluation.json")
@@ -113,7 +121,9 @@ class MLflowExperimentManager:
         if winner not in self.run_ids:
             raise ValueError("Log MLflow runs before registry promotion.")
         version = mlflow.register_model(self.model_uris[winner], self.registered_model_name)
-        self.client.set_model_version_tag(self.registered_model_name, version.version, "threshold", str(final["threshold"]))
+        contract = project.model_contract(winner)
+        self.client.set_model_version_tag(self.registered_model_name, version.version, "decision_threshold", str(contract["decision_threshold"]))
+        self.client.set_model_version_tag(self.registered_model_name, version.version, "model_contract_schema_version", str(contract["schema_version"]))
         self.client.set_model_version_tag(self.registered_model_name, version.version, "promotion_gate", "final_holdout_fraud_f1_and_recall")
         self.client.set_registered_model_alias(self.registered_model_name, "champion", version.version)
         return {"model": winner, "run_id": self.run_ids[winner], "version": version.version,
