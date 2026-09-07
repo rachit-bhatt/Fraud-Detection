@@ -1,5 +1,11 @@
+import sys
+from pathlib import Path
+
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+
+# Add parent directory to path so we can import main
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from main import FraudDetectionProject, TrainingConfig
 
 def test_metrics_and_grid_metadata(tmp_path):
