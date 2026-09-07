@@ -34,7 +34,7 @@ class TrainingConfig:
     model_path: Path = Path("models/fraud_detection_model.pkl")
     random_state: int = 42
     validation_size: float = 0.20
-    test_size: float = 0.30
+    threshold_validation_size: float = 0.20
     non_fraud_sample_fraction: float = 0.10
     cv_folds: int = 5
     search_scoring: str = "f1"
@@ -72,23 +72,26 @@ class FraudDetectionProject:
             raise ValueError("Dataset requires a binary 'Class' target column.")
 
     def preprocess_data(self) -> None:
-        """Create an untouched holdout, then balance development data only."""
+        """Keep threshold validation and final holdout at production prevalence."""
         if self.df_original is None:
             raise ValueError("Run load_data() before preprocess_data().")
         X, y = self.df_original.drop(columns="Class"), self.df_original.Class
         development_X, self.X_validation, development_y, self.y_validation = train_test_split(
             X, y, test_size=self.config.validation_size, random_state=self.config.random_state, stratify=y
         )
-        development = development_X.assign(Class=development_y)
-        fraud = development[development.Class == 1]
-        non_fraud = development[development.Class == 0].sample(
+        training_X, self.X_test, training_y, self.y_test = train_test_split(
+            development_X, development_y, test_size=self.config.threshold_validation_size,
+            random_state=self.config.random_state, stratify=development_y,
+        )
+        # Only the fitting partition is rebalanced. X_test/y_test deliberately
+        # preserve the real fraud rate for threshold selection.
+        training = training_X.assign(Class=training_y)
+        fraud = training[training.Class == 1]
+        non_fraud = training[training.Class == 0].sample(
             frac=self.config.non_fraud_sample_fraction, random_state=self.config.random_state
         )
         balanced = pd.concat([fraud, non_fraud], ignore_index=True).sample(frac=1, random_state=self.config.random_state)
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
-            balanced.drop(columns="Class"), balanced.Class, test_size=self.config.test_size,
-            random_state=self.config.random_state, stratify=balanced.Class,
-        )
+        self.X_train, self.y_train = balanced.drop(columns="Class"), balanced.Class
 
     def train_model(self, model_name: str, model: ClassifierMixin, param_grid: dict[str, list[Any]] | None = None) -> None:
         if self.X_train is None or self.y_train is None:
@@ -134,7 +137,7 @@ class FraudDetectionProject:
         return result
 
     def tune_threshold(self, model_name: str, metric: str = "fraud_f1") -> float:
-        """Choose a score threshold on development data; never final holdout."""
+        """Choose a threshold at production prevalence; never final holdout."""
         if self.X_test is None or self.y_test is None:
             raise ValueError("Run preprocess_data() before threshold tuning.")
         scores = self._prediction_scores(self.models[model_name], self.X_test)
@@ -208,7 +211,9 @@ class FraudDetectionProject:
         return {"dataset_path": str(self.config.dataset_path), "dataset_rows": len(self.df_original),
                 "fraud_rate": float(self.df_original.Class.mean()), "feature_count": len(self.feature_names),
                 "random_state": self.config.random_state, "validation_size": self.config.validation_size,
-                "development_non_fraud_fraction": self.config.non_fraud_sample_fraction}
+                "development_non_fraud_fraction": self.config.non_fraud_sample_fraction,
+                "threshold_validation_size": self.config.threshold_validation_size,
+                "threshold_validation_fraud_rate": float(self.y_test.mean()) if self.y_test is not None else None}
 
     def model_contract(self, model_name: str) -> dict[str, Any]:
         """Return the immutable inference contract evaluated for this candidate."""

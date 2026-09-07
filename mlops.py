@@ -89,7 +89,7 @@ class MLflowExperimentManager:
             development, final = project.results[model_name], project.validation_results[model_name]
             metrics = self._numeric_metrics(development, "development_") | self._numeric_metrics(final, "final_")
             tags = {"model_name": model_name, "model_class": type(model).__name__, "task": "binary_fraud_detection",
-                    "evaluation_strategy": "balanced_development_plus_untouched_original_holdout",
+                    "evaluation_strategy": "balanced_training_plus_original_prevalence_threshold_validation_and_final_holdout",
                     "search_performed": str(project.training_metadata[model_name]["search_performed"])}
             with mlflow.start_run(experiment_id=self.experiment_id, run_name=model_name) as run:
                 mlflow.set_tags(tags); mlflow.log_params(self._parameters(project, model_name)); mlflow.log_metrics(metrics)

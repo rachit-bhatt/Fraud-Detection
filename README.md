@@ -26,9 +26,9 @@ The purpose is not merely to train a model. It is to demonstrate how an ML syste
 ```mermaid
 flowchart LR
     A[(Credit-card<br/>transactions)] --> B[Data validation<br/>& split]
-    B --> C[Development balancing]
+    B --> C[Balance training<br/>partition only]
     C --> D[Train five<br/>candidate models]
-    D --> E[Fraud-focused<br/>evaluation]
+    D --> E[Threshold validation at<br/>original fraud prevalence]
     E --> F[(MLflow<br/>experiment runs)]
     F --> G{Final holdout<br/>promotion gate}
     G -->|Approved| H[(Model Registry<br/>champion)]
@@ -119,11 +119,10 @@ flowchart TD
     A[Original data<br/>highly imbalanced] --> B{Stratified split}
     B -->|20%| C[Final holdout<br/>original class distribution]
     B -->|80%| D[Development data]
-    D --> E[Keep all fraud rows]
-    D --> F[Sample non-fraud rows]
-    E --> G[Balanced development set]
-    F --> G
-    G --> H[Train / development test]
+    D -->|20%| H[Threshold validation<br/>original distribution]
+    D -->|80%| E[Training partition]
+    E --> F[Keep all fraud rows +<br/>sample non-fraud rows]
+    F --> G[Balanced training set]
     C --> I[Final validation only]
     classDef final fill:#211443,stroke:#9c7cff,color:#fff;
     classDef dev fill:#062b3a,stroke:#00e5ff,color:#fff;
@@ -147,7 +146,7 @@ Grid searches use fraud F1 for scoring. Their `best_params_`, best cross-validat
 
 ### 3. Tune the decision threshold
 
-Models produce a fraud score. A threshold sweep on development data chooses the threshold that maximizes fraud F1. The selected threshold and both development/final metrics are recorded in the experiment metadata.
+Models produce a fraud score. A threshold sweep on an original-prevalence development-validation split chooses the threshold that maximizes fraud F1. Only the fitting partition is balanced; this keeps the selected threshold aligned with production class prevalence. The selected threshold and both threshold-validation/final metrics are recorded in experiment metadata.
 
 ### 4. Validate and track
 
